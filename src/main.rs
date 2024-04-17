@@ -5,43 +5,63 @@ use bevy::{
     math::Vec3Swizzles,
     prelude::*,
     sprite::{MaterialMesh2dBundle, Mesh2dHandle},
+    tasks::ComputeTaskPool
 };
-use bevy_spatial::{kdtree::KDTree2, SpatialAccess};
-use bevy_spatial::{AutomaticUpdate, SpatialStructure};
+use bevy_spatial::{
+    AutomaticUpdate,
+    kdtree::KDTree2,
+    SpatialAccess,
+    SpatialStructure
+};
 
-const BOUNDS: Vec2 = Vec2::new(1300.0, 760.0);
+const BOUNDS: Vec2 = Vec2::new(540.0, 480.0);
 const BOID_COUNT: i32 = 1000;
-const BOID_SIZE: f32 = 0.5;
-const BOID_SPEED: f32 = 300.;
-const BOID_VIS_RANGE: f32 = 50.0;
-const VIS_RANGE_SQ: f32 = BOID_VIS_RANGE*BOID_VIS_RANGE;
-const BOID_PROT_RANGE: f32 = 10.0;
+const BOID_SIZE: f32 = 0.25;
+const BOID_SPEED: f32 = 100.;
+const BOID_VIS_RANGE: f32 = 100.;
+const BOID_PROT_RANGE: f32 = 10.;
 const PROT_RANGE_SQ: f32 = BOID_PROT_RANGE*BOID_PROT_RANGE;
 const BOID_CENTER_FACTOR: f32 = 0.0005;
-const BOID_MATCHING_FACTOR: f32 = 0.05;
-const BOID_AVOID_FACTOR: f32 = 0.05;
+const BOID_MATCHING_FACTOR: f32 = 0.0125;
+const BOID_AVOID_FACTOR: f32 = 1.0;
+const BOID_CHASE_FACTOR: f32 = 0.00125;
+const BOID_MOUSE_CHASE_FACTOR: f32 = 0.0125;
 const BOID_MIN_SPEED: f32 = 50.0;
 const BOID_MAX_SPEED: f32 = 200.0;
+const BOID_SPEED_DECAY: f32 = 0.99;
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
-        // Track boids in the KD-Tree
-        .add_plugins(
+        .add_plugins((
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    resolution: (BOUNDS.x, BOUNDS.y).into(),
+                   ..default()
+                }),
+                ..default()
+            }),
+            // Track boids in the KD-Tree
             AutomaticUpdate::<SpatialEntity>::new()
                 // TODO: check perf of other tree types
                 .with_spatial_ds(SpatialStructure::KDTree2)
                 .with_frequency(Duration::from_millis(16)),
-        )
+        ))
+        .add_event::<DvEvent>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_systems(Startup, setup)
-        .add_systems(FixedUpdate, (update_position))
+        .add_systems(FixedUpdate, (
+            (
+                flocking_system,
+                velocity_system,
+                movement_system
+            ).chain(),
+        ))
         .add_systems(Update, bevy::window::close_on_esc)
         .run();
 }
 
 // Marker for entities tracked by KDTree
-#[derive(Component)]
+#[derive(Component, Default)]
 struct SpatialEntity;
 
 #[derive(Component)]
@@ -61,6 +81,10 @@ impl Default for BoidBundle {
         }
     }
 }
+
+// Event for a change of velocity on some boid
+#[derive(Event)]
+struct DvEvent(Entity, Vec2);
 
 fn setup(
     mut commands: Commands,
@@ -92,6 +116,7 @@ fn setup(
                 mesh: MaterialMesh2dBundle {
                     mesh: Mesh2dHandle(meshes.add(Circle { radius: 4.0 })),
                     material: materials.add(
+                        // Random color for each boid
                         Color::hsl(360. * rng.gen::<f32>(), rng.gen(), 0.7)
                     ),
                     transform,
@@ -104,90 +129,158 @@ fn setup(
     }
 }
 
-// fn update_velocity(
-//     tree: Res<KDTree2<SpatialEntity>>,
-//     qboid: Query<(Entity, &Transform), With<SpatialEntity>>,
-//     mut qvelocity: Query<&mut Velocity>
-// ) {
-//     for (boid, t0) in qboid.iter() {
-//         let mut xpos_avg = 0.;
-//         let mut ypos_avg = 0.;
-//         let mut xvel_avg = 0.;
-//         let mut yvel_avg = 0.;
-//         let mut close_dx = 0.;
-//         let mut close_dy = 0.;
-//         let mut neighboring_boids = 0.;
-//
-//         let p0 = t0.translation.xy();
-//
-//         let Ok(mut v0) = qvelocity.get_mut(boid) else { todo!(); };
-//
-//         for (_, entity) in tree.within_distance(p0, BOID_VIS_RANGE) {
-//             let Ok((_, t1)) = qboid.get(entity.unwrap()) else { todo!() };
-//             let Ok(v1) = qvelocity.get(entity.unwrap()) else { todo!() };
-//
-//             // don't evaluate boid against itself
-//             if t0.translation == t1.translation {
-//                 continue;
-//             }
-//
-//             let p1 = t1.translation.xy();
-//
-//             let dx = p0.x - p1.x;
-//             let dy = p0.y - p1.y;
-//
-//             let squared_distance = dx*dx + dy*dy;
-//
-//             if squared_distance < PROT_RANGE_SQ {
-//                 close_dx += dx;
-//                 close_dy += dy;
-//             } else {
-//                 xpos_avg += p1.x;
-//                 ypos_avg += p1.y;
-//                 xvel_avg += v1.0.x;
-//                 yvel_avg += v1.0.y;
-//                 neighboring_boids += 1.;
-//             }
-//         }
-//
-//         if neighboring_boids > 0. {
-//             xpos_avg /= neighboring_boids;
-//             ypos_avg /= neighboring_boids;
-//             xvel_avg /= neighboring_boids;
-//             yvel_avg /= neighboring_boids;
-//
-//             v0.0.x += (xpos_avg - p0.x) * BOID_CENTER_FACTOR + (xvel_avg - p0.x) * BOID_MATCHING_FACTOR;
-//             v0.0.y += (ypos_avg - p0.y) * BOID_CENTER_FACTOR + (yvel_avg - p0.y) * BOID_MATCHING_FACTOR;
-//         }
-//
-//         v0.0.x += close_dx * BOID_AVOID_FACTOR;
-//         v0.0.y += close_dy * BOID_AVOID_FACTOR;
-//
-//         let speed = (v0.0.x*v0.0.x + v0.0.y*v0.0.y).sqrt();
-//
-//         if speed < BOID_MIN_SPEED {
-//             v0.0.x *= BOID_MIN_SPEED / speed;
-//             v0.0.y *= BOID_MIN_SPEED / speed;
-//         }
-//         if speed > BOID_MAX_SPEED {
-//             v0.0.x *= BOID_MAX_SPEED / speed;
-//             v0.0.y *= BOID_MAX_SPEED / speed;
-//         }
-//     }
-// }
+fn flocking_system(
+    boid_query: Query<(Entity, &Velocity, &Transform), With<SpatialEntity>>,
+    kdtree: Res<KDTree2<SpatialEntity>>,
+    mut dv_event_writer: EventWriter<DvEvent>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    window: Query<&Window>,
+) {
+    let pool = ComputeTaskPool::get();
+    let boids = boid_query.iter().collect::<Vec<_>>();
+    let boids_per_thread = (boids.len() / pool.thread_num()) + 1;
 
-fn update_position(
+    let event_batches = pool.scope(|s| {
+        let kdtree = &kdtree;
+        let boid_query = &boid_query;
+        let camera = &camera;
+        let window = &window;
+
+        for chunk in boids.chunks(boids_per_thread) {
+            s.spawn(async move {
+                let mut dv_events: Vec<DvEvent> = vec![];
+                for (boid, _, t0) in chunk {
+                    let p0 = t0.translation.xy();
+
+                    let mut dv = Vec2::default();
+                    let mut vec_away = Vec2::default();
+                    let mut avg_position = Vec2::default();
+                    let mut avg_velocity = Vec2::default();
+                    let mut neighboring_boids = 0;
+                    let mut close_boids = 0;
+
+                    for (_, entity) in kdtree.within_distance(p0, BOID_VIS_RANGE) {
+                        let Ok((other, v1, t1)) = boid_query.get(entity.unwrap()) else { todo!() };
+
+                        // Don't evaluate against itself
+                        if *boid == other {
+                            continue;
+                        }
+
+                        let vec_to = (t1.translation - t0.translation).xy();
+                        let dist_sq = vec_to.x*vec_to.x + vec_to.y*vec_to.y;
+
+                        if dist_sq < PROT_RANGE_SQ {
+                            // separation
+                            vec_away -= vec_to * (PROT_RANGE_SQ - dist_sq) / PROT_RANGE_SQ;
+                            close_boids += 1;
+                        } else {
+                            // cohesion
+                            avg_position += vec_to;
+                            // alignment
+                            avg_velocity += v1.0;
+
+                            neighboring_boids += 1;
+                        }
+                    }
+
+                    if neighboring_boids > 0 {
+                        let neighbors = neighboring_boids as f32;
+                        dv += avg_position / neighbors * BOID_CENTER_FACTOR;
+                        dv += avg_velocity / neighbors * BOID_MATCHING_FACTOR;
+                    }
+
+                    if close_boids > 0 {
+                        let close = close_boids as f32;
+                        dv += vec_away / close * BOID_AVOID_FACTOR;
+                    }
+
+                    // Chase the mouse
+                    let (camera, t_camera) = camera.single();
+                    if let Some(c_window) = window.single().cursor_position() {
+                        if let Some(c_world) = camera.viewport_to_world_2d(t_camera, c_window) {
+                            let to_cursor = c_world - t0.translation.xy();
+                            dv += to_cursor * BOID_MOUSE_CHASE_FACTOR;
+                        } else {};
+                    } else {};
+
+                    // Bias towards the origin
+                    let to_world = -t0.translation.xy();
+                    dv += to_world * BOID_CHASE_FACTOR;
+
+                    dv_events.push(DvEvent(*boid, dv));
+                }
+
+                dv_events
+            });
+        }
+    });
+
+    for batch in event_batches {
+        dv_event_writer.send_batch(batch);
+    }
+}
+
+fn velocity_system(
+    mut events: EventReader<DvEvent>,
+    mut boids: Query<(&mut Velocity, &mut Transform)>,
+) {
+    for DvEvent(boid, dv) in events.read() {
+        let Ok((mut velocity, mut transform)) = boids.get_mut(*boid) else { todo!() };
+
+        velocity.0.x += dv.x;
+        velocity.0.y += dv.y;
+
+        let fuzzed_width = BOUNDS.x / 2.0 - 1.0;
+        let fuzzed_height = BOUNDS.y / 2.0 - 1.0;
+
+        // Bounce off walls with a speed penalty
+        if transform.translation.x < -fuzzed_width {
+            velocity.0.x = (velocity.0.x * -0.95).clamp(0.1, BOID_MAX_SPEED);
+        }
+        else if transform.translation.x > fuzzed_width {
+            velocity.0.x = (velocity.0.x * -0.95).clamp(-BOID_MAX_SPEED, -0.1);
+        }
+
+        if transform.translation.y < -fuzzed_height {
+            velocity.0.y = (velocity.0.y * -0.95).clamp(0.1, BOID_MAX_SPEED);
+        }
+        else if transform.translation.y > fuzzed_height {
+            velocity.0.y = (velocity.0.y * -0.95).clamp(-BOID_MAX_SPEED, - 0.1);
+        }
+
+        // // Teleport to opposite side of the screen
+        // if transform.translation.x.abs() > fuzzed_width {
+        //     transform.translation.x *= -1.;
+        // }
+        // if transform.translation.y.abs() > fuzzed_height {
+        //     transform.translation.y *= -1.;
+        // }
+
+        // Clamp speed
+        let speed = velocity.0.length();
+
+        if speed < BOID_MIN_SPEED {
+            velocity.0 *= BOID_MIN_SPEED / speed;
+        }
+        if speed > BOID_MAX_SPEED {
+            velocity.0 *= BOID_MAX_SPEED / speed;
+        }
+
+        // Dampen velocity
+        velocity.0 *= BOID_SPEED_DECAY;
+    }
+}
+
+fn movement_system(
     time: Res<Time>,
     mut query: Query<(&mut Velocity, &mut Transform)>,
 ) {
-    for (mut velocity, mut transform) in query.iter_mut() {
-        if transform.translation.x.abs() < BOUNDS.x / 2.0
-            && transform.translation.y.abs() < BOUNDS.y / 2.0
-        {
-            transform.translation += Vec3::from((velocity.0, 0.0)) * time.delta_seconds();
-        } else {
-            velocity.0 *= -1.0;
-            transform.translation += Vec3::from((velocity.0, 0.0)) * time.delta_seconds();
-        }
+    // Update position and keep boids within the window
+    for (velocity, mut transform) in query.iter_mut() {
+        transform.translation.x = (transform.translation.x + velocity.0.x * time.delta_seconds())
+            .clamp(-BOUNDS.x / 2.0, BOUNDS.x / 2.0);
+        transform.translation.y = (transform.translation.y + velocity.0.y * time.delta_seconds())
+            .clamp(-BOUNDS.y / 2.0, BOUNDS.y / 2.0);
     }
 }
