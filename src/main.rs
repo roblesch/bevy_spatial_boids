@@ -6,32 +6,31 @@ use bevy::{
     prelude::*,
     render::{mesh::*, render_asset::RenderAssetUsages},
     sprite::{MaterialMesh2dBundle, Mesh2dHandle},
-    tasks::ComputeTaskPool
+    tasks::ComputeTaskPool,
 };
 use bevy_spatial::{
     AutomaticUpdate,
     kdtree::KDTree2,
     SpatialAccess,
-    SpatialStructure
+    SpatialStructure,
 };
 
-const WINDOW_BOUNDS: Vec2 = Vec2::new(800., 600.);
-const BOID_BOUNDS: Vec2 = Vec2::new(WINDOW_BOUNDS.x * 2./3., WINDOW_BOUNDS.y * 2./3.);
-const BOID_COUNT: i32 = 1000;
-const BOID_SIZE: f32 = 4.;
-const BOID_SPEED: f32 = 100.;
+const WINDOW_BOUNDS: Vec2 = Vec2::new(400., 400.);
+const BOID_BOUNDS: Vec2 = Vec2::new(WINDOW_BOUNDS.x * 2. / 3., WINDOW_BOUNDS.y * 2. / 3.);
+const BOID_COUNT: i32 = 500;
+const BOID_SIZE: f32 = 5.;
 const BOID_VIS_RANGE: f32 = 40.;
 const BOID_PROT_RANGE: f32 = 8.;
-const BOID_FOV_DEG: f32 = 120.;
-const PROT_RANGE_SQ: f32 = BOID_PROT_RANGE*BOID_PROT_RANGE;
+// https://en.wikipedia.org/wiki/Bird_vision#Extraocular_anatomy
+const BOID_FOV: f32 = 120. * std::f32::consts::PI / 180.;
+const PROT_RANGE_SQ: f32 = BOID_PROT_RANGE * BOID_PROT_RANGE;
 const BOID_CENTER_FACTOR: f32 = 0.0005;
 const BOID_MATCHING_FACTOR: f32 = 0.05;
 const BOID_AVOID_FACTOR: f32 = 0.05;
 const BOID_TURN_FACTOR: f32 = 0.2;
-const BOID_MOUSE_CHASE_FACTOR: f32 = 0.005;
+const BOID_MOUSE_CHASE_FACTOR: f32 = 0.0005;
 const BOID_MIN_SPEED: f32 = 2.0;
 const BOID_MAX_SPEED: f32 = 4.0;
-const BOID_SPEED_DECAY: f32 = 1.;
 
 fn main() {
     App::new()
@@ -39,7 +38,7 @@ fn main() {
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     resolution: (WINDOW_BOUNDS.x, WINDOW_BOUNDS.y).into(),
-                   ..default()
+                    ..default()
                 }),
                 ..default()
             }),
@@ -113,7 +112,7 @@ fn setup(
         transform.rotate_z(0.0);
 
         let velocity = Velocity(Vec2::new(rng.gen_range(-1.0..1.0),
-                                          rng.gen_range(-1.0..1.0)) * BOID_SPEED);
+                                          rng.gen_range(-1.0..1.0)));
 
         commands.spawn((
             BoidBundle {
@@ -121,10 +120,10 @@ fn setup(
                     mesh: Mesh2dHandle(meshes.add(
                         Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
                             .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![
-                                [-0.5,  0.5, 0.0],
-                                [ 1.0,  0.0, 0.0],
+                                [-0.5, 0.5, 0.0],
+                                [1.0, 0.0, 0.0],
                                 [-0.5, -0.5, 0.0],
-                                [ 0.0,  0.0, 0.0]
+                                [0.0, 0.0, 0.0],
                             ])
                             .with_inserted_indices(Indices::U32(vec![
                                 1, 3, 0,
@@ -143,6 +142,13 @@ fn setup(
             SpatialEntity
         ));
     }
+}
+
+fn angle_towards(a: Vec2, b: Vec2) -> f32 {
+    // https://stackoverflow.com/a/68929139
+    let dir = b - a;
+    let angle = dir.y.atan2(dir.x);
+    angle
 }
 
 fn draw_boid_gizmos(
@@ -176,12 +182,12 @@ fn flocking_dv(
         }
 
         // Don't evaluate boids behind
-        if t0.forward().angle_between(t1.translation - t0.translation) > f32::to_radians(BOID_FOV_DEG) {
+        if angle_towards(t0.translation.xy(), t1.translation.xy()) > BOID_FOV {
             continue;
         }
 
         let vec_to = (t1.translation - t0.translation).xy();
-        let dist_sq = vec_to.x*vec_to.x + vec_to.y*vec_to.y;
+        let dist_sq = vec_to.x * vec_to.x + vec_to.y * vec_to.y;
 
         if dist_sq < PROT_RANGE_SQ {
             // separation
@@ -243,7 +249,7 @@ fn flocking_system(
 
                 for (boid, _, t0) in chunk {
                     dv_batch.push(DvEvent(*boid, flocking_dv(
-                        kdtree, boid_query, camera, window, boid, t0
+                        kdtree, boid_query, camera, window, boid, t0,
                     )));
                 }
 
@@ -291,9 +297,6 @@ fn velocity_system(
         if speed > BOID_MAX_SPEED {
             velocity.0 *= BOID_MAX_SPEED / speed;
         }
-
-        // Dampen velocity
-        velocity.0 *= BOID_SPEED_DECAY;
     }
 }
 
@@ -301,9 +304,8 @@ fn movement_system(
     mut query: Query<(&mut Velocity, &mut Transform)>,
 ) {
     for (velocity, mut transform) in query.iter_mut() {
-        // https://stackoverflow.com/a/68929139
-        let angle = velocity.0.y.atan2(velocity.0.x);
-        transform.rotation = Quat::from_axis_angle(Vec3::Z, angle);
+        transform.rotation = Quat::from_axis_angle(
+            Vec3::Z, angle_towards(Vec2::ZERO, velocity.0));
         transform.translation.x += velocity.0.x;
         transform.translation.y += velocity.0.y;
     }
