@@ -4,6 +4,7 @@ use halton::Sequence;
 use bevy::{
     math::Vec3Swizzles,
     prelude::*,
+    render::{mesh::*, render_asset::RenderAssetUsages},
     sprite::{MaterialMesh2dBundle, Mesh2dHandle},
     tasks::ComputeTaskPool
 };
@@ -14,28 +15,30 @@ use bevy_spatial::{
     SpatialStructure
 };
 
-const BOUNDS: Vec2 = Vec2::new(540.0, 480.0);
+const WINDOW_BOUNDS: Vec2 = Vec2::new(800., 600.);
+const BOID_BOUNDS: Vec2 = Vec2::new(WINDOW_BOUNDS.x * 2./3., WINDOW_BOUNDS.y * 2./3.);
 const BOID_COUNT: i32 = 1000;
-const BOID_SIZE: f32 = 0.25;
+const BOID_SIZE: f32 = 4.;
 const BOID_SPEED: f32 = 100.;
-const BOID_VIS_RANGE: f32 = 100.;
-const BOID_PROT_RANGE: f32 = 10.;
+const BOID_VIS_RANGE: f32 = 40.;
+const BOID_PROT_RANGE: f32 = 8.;
+const BOID_FOV_DEG: f32 = 120.;
 const PROT_RANGE_SQ: f32 = BOID_PROT_RANGE*BOID_PROT_RANGE;
 const BOID_CENTER_FACTOR: f32 = 0.0005;
-const BOID_MATCHING_FACTOR: f32 = 0.0125;
-const BOID_AVOID_FACTOR: f32 = 1.0;
-const BOID_CHASE_FACTOR: f32 = 0.00125;
-const BOID_MOUSE_CHASE_FACTOR: f32 = 0.0125;
-const BOID_MIN_SPEED: f32 = 50.0;
-const BOID_MAX_SPEED: f32 = 200.0;
-const BOID_SPEED_DECAY: f32 = 0.99;
+const BOID_MATCHING_FACTOR: f32 = 0.05;
+const BOID_AVOID_FACTOR: f32 = 0.05;
+const BOID_TURN_FACTOR: f32 = 0.2;
+const BOID_MOUSE_CHASE_FACTOR: f32 = 0.005;
+const BOID_MIN_SPEED: f32 = 2.0;
+const BOID_MAX_SPEED: f32 = 4.0;
+const BOID_SPEED_DECAY: f32 = 1.;
 
 fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    resolution: (BOUNDS.x, BOUNDS.y).into(),
+                    resolution: (WINDOW_BOUNDS.x, WINDOW_BOUNDS.y).into(),
                    ..default()
                 }),
                 ..default()
@@ -46,17 +49,18 @@ fn main() {
                 .with_spatial_ds(SpatialStructure::KDTree2)
                 .with_frequency(Duration::from_millis(16)),
         ))
-        .add_event::<DvEvent>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .add_event::<DvEvent>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, (
-            (
-                flocking_system,
-                velocity_system,
-                movement_system
-            ).chain(),
+            flocking_system,
+            velocity_system,
+            movement_system
+        ).chain())
+        .add_systems(Update, (
+            draw_boid_gizmos,
+            bevy::window::close_on_esc,
         ))
-        .add_systems(Update, bevy::window::close_on_esc)
         .run();
 }
 
@@ -100,8 +104,8 @@ fn setup(
         .zip(1..BOID_COUNT);
 
     for ((x, y), _) in seq {
-        let spawn_x = (x as f32 * BOUNDS.x) - BOUNDS.x / 2.0;
-        let spawn_y = (y as f32 * BOUNDS.y) - BOUNDS.y / 2.0;
+        let spawn_x = (x as f32 * WINDOW_BOUNDS.x) - WINDOW_BOUNDS.x / 2.0;
+        let spawn_y = (y as f32 * WINDOW_BOUNDS.y) - WINDOW_BOUNDS.y / 2.0;
 
         let mut transform = Transform::from_xyz(spawn_x, spawn_y, 0.0)
             .with_scale(Vec3::splat(BOID_SIZE));
@@ -114,7 +118,19 @@ fn setup(
         commands.spawn((
             BoidBundle {
                 mesh: MaterialMesh2dBundle {
-                    mesh: Mesh2dHandle(meshes.add(Circle { radius: 4.0 })),
+                    mesh: Mesh2dHandle(meshes.add(
+                        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![
+                                [-0.5,  0.5, 0.0],
+                                [ 1.0,  0.0, 0.0],
+                                [-0.5, -0.5, 0.0],
+                                [ 0.0,  0.0, 0.0]
+                            ])
+                            .with_inserted_indices(Indices::U32(vec![
+                                1, 3, 0,
+                                1, 2, 3,
+                            ]))
+                    )),
                     material: materials.add(
                         // Random color for each boid
                         Color::hsl(360. * rng.gen::<f32>(), rng.gen(), 0.7)
@@ -129,6 +145,80 @@ fn setup(
     }
 }
 
+fn draw_boid_gizmos(
+    mut gizmos: Gizmos,
+) {
+    gizmos.rect_2d(Vec2::ZERO, 0.0, BOID_BOUNDS, Color::GRAY);
+}
+
+fn flocking_dv(
+    kdtree: &Res<KDTree2<SpatialEntity>>,
+    boid_query: &Query<(Entity, &Velocity, &Transform), With<SpatialEntity>>,
+    camera: &Query<(&Camera, &GlobalTransform)>,
+    window: &Query<&Window>,
+    boid: &Entity,
+    t0: &&Transform,
+) -> Vec2 {
+    // https://vanhunteradams.com/Pico/Animal_Movement/Boids-algorithm.html
+    let mut dv = Vec2::default();
+    let mut vec_away = Vec2::default();
+    let mut avg_position = Vec2::default();
+    let mut avg_velocity = Vec2::default();
+    let mut neighboring_boids = 0;
+    let mut close_boids = 0;
+
+    for (_, entity) in kdtree.within_distance(t0.translation.xy(), BOID_VIS_RANGE) {
+        let Ok((other, v1, t1)) = boid_query.get(entity.unwrap()) else { todo!() };
+
+        // Don't evaluate against itself
+        if *boid == other {
+            continue;
+        }
+
+        // Don't evaluate boids behind
+        if t0.forward().angle_between(t1.translation - t0.translation) > f32::to_radians(BOID_FOV_DEG) {
+            continue;
+        }
+
+        let vec_to = (t1.translation - t0.translation).xy();
+        let dist_sq = vec_to.x*vec_to.x + vec_to.y*vec_to.y;
+
+        if dist_sq < PROT_RANGE_SQ {
+            // separation
+            vec_away -= vec_to;
+            close_boids += 1;
+        } else {
+            // cohesion
+            avg_position += vec_to;
+            // alignment
+            avg_velocity += v1.0;
+            neighboring_boids += 1;
+        }
+    }
+
+    if neighboring_boids > 0 {
+        let neighbors = neighboring_boids as f32;
+        dv += avg_position / neighbors * BOID_CENTER_FACTOR;
+        dv += avg_velocity / neighbors * BOID_MATCHING_FACTOR;
+    }
+
+    if close_boids > 0 {
+        let close = close_boids as f32;
+        dv += vec_away / close * BOID_AVOID_FACTOR;
+    }
+
+    // Chase the mouse
+    let (camera, t_camera) = camera.single();
+    if let Some(c_window) = window.single().cursor_position() {
+        if let Some(c_world) = camera.viewport_to_world_2d(t_camera, c_window) {
+            let to_cursor = c_world - t0.translation.xy();
+            dv += to_cursor * BOID_MOUSE_CHASE_FACTOR;
+        } else {};
+    } else {};
+
+    dv
+}
+
 fn flocking_system(
     boid_query: Query<(Entity, &Velocity, &Transform), With<SpatialEntity>>,
     kdtree: Res<KDTree2<SpatialEntity>>,
@@ -138,85 +228,29 @@ fn flocking_system(
 ) {
     let pool = ComputeTaskPool::get();
     let boids = boid_query.iter().collect::<Vec<_>>();
-    let boids_per_thread = (boids.len() / pool.thread_num()) + 1;
+    let boids_per_thread = (boids.len() + pool.thread_num() - 1) / pool.thread_num();
 
-    let event_batches = pool.scope(|s| {
-        let kdtree = &kdtree;
-        let boid_query = &boid_query;
-        let camera = &camera;
-        let window = &window;
-
+    // https://docs.rs/bevy/latest/bevy/tasks/struct.ComputeTaskPool.html
+    for batch in pool.scope(|s| {
         for chunk in boids.chunks(boids_per_thread) {
+            let kdtree = &kdtree;
+            let boid_query = &boid_query;
+            let camera = &camera;
+            let window = &window;
+
             s.spawn(async move {
-                let mut dv_events: Vec<DvEvent> = vec![];
+                let mut dv_batch: Vec<DvEvent> = vec![];
+
                 for (boid, _, t0) in chunk {
-                    let p0 = t0.translation.xy();
-
-                    let mut dv = Vec2::default();
-                    let mut vec_away = Vec2::default();
-                    let mut avg_position = Vec2::default();
-                    let mut avg_velocity = Vec2::default();
-                    let mut neighboring_boids = 0;
-                    let mut close_boids = 0;
-
-                    for (_, entity) in kdtree.within_distance(p0, BOID_VIS_RANGE) {
-                        let Ok((other, v1, t1)) = boid_query.get(entity.unwrap()) else { todo!() };
-
-                        // Don't evaluate against itself
-                        if *boid == other {
-                            continue;
-                        }
-
-                        let vec_to = (t1.translation - t0.translation).xy();
-                        let dist_sq = vec_to.x*vec_to.x + vec_to.y*vec_to.y;
-
-                        if dist_sq < PROT_RANGE_SQ {
-                            // separation
-                            vec_away -= vec_to * (PROT_RANGE_SQ - dist_sq) / PROT_RANGE_SQ;
-                            close_boids += 1;
-                        } else {
-                            // cohesion
-                            avg_position += vec_to;
-                            // alignment
-                            avg_velocity += v1.0;
-
-                            neighboring_boids += 1;
-                        }
-                    }
-
-                    if neighboring_boids > 0 {
-                        let neighbors = neighboring_boids as f32;
-                        dv += avg_position / neighbors * BOID_CENTER_FACTOR;
-                        dv += avg_velocity / neighbors * BOID_MATCHING_FACTOR;
-                    }
-
-                    if close_boids > 0 {
-                        let close = close_boids as f32;
-                        dv += vec_away / close * BOID_AVOID_FACTOR;
-                    }
-
-                    // Chase the mouse
-                    let (camera, t_camera) = camera.single();
-                    if let Some(c_window) = window.single().cursor_position() {
-                        if let Some(c_world) = camera.viewport_to_world_2d(t_camera, c_window) {
-                            let to_cursor = c_world - t0.translation.xy();
-                            dv += to_cursor * BOID_MOUSE_CHASE_FACTOR;
-                        } else {};
-                    } else {};
-
-                    // Bias towards the origin
-                    let to_world = -t0.translation.xy();
-                    dv += to_world * BOID_CHASE_FACTOR;
-
-                    dv_events.push(DvEvent(*boid, dv));
+                    dv_batch.push(DvEvent(*boid, flocking_dv(
+                        kdtree, boid_query, camera, window, boid, t0
+                    )));
                 }
 
-                dv_events
+                dv_batch
             });
         }
-    });
-
-    for batch in event_batches {
+    }) {
         dv_event_writer.send_batch(batch);
     }
 }
@@ -226,36 +260,27 @@ fn velocity_system(
     mut boids: Query<(&mut Velocity, &mut Transform)>,
 ) {
     for DvEvent(boid, dv) in events.read() {
-        let Ok((mut velocity, mut transform)) = boids.get_mut(*boid) else { todo!() };
+        let Ok((mut velocity, transform)) = boids.get_mut(*boid) else { todo!() };
 
         velocity.0.x += dv.x;
         velocity.0.y += dv.y;
 
-        let fuzzed_width = BOUNDS.x / 2.0 - 1.0;
-        let fuzzed_height = BOUNDS.y / 2.0 - 1.0;
+        let width = BOID_BOUNDS.x / 2.;
+        let height = BOID_BOUNDS.y / 2.;
 
-        // Bounce off walls with a speed penalty
-        if transform.translation.x < -fuzzed_width {
-            velocity.0.x = (velocity.0.x * -0.95).clamp(0.1, BOID_MAX_SPEED);
+        // Steer back into visible region
+        if transform.translation.x < -width {
+            velocity.0.x += BOID_TURN_FACTOR;
         }
-        else if transform.translation.x > fuzzed_width {
-            velocity.0.x = (velocity.0.x * -0.95).clamp(-BOID_MAX_SPEED, -0.1);
+        if transform.translation.x > width {
+            velocity.0.x -= BOID_TURN_FACTOR;
         }
-
-        if transform.translation.y < -fuzzed_height {
-            velocity.0.y = (velocity.0.y * -0.95).clamp(0.1, BOID_MAX_SPEED);
+        if transform.translation.y < -height {
+            velocity.0.y += BOID_TURN_FACTOR;
         }
-        else if transform.translation.y > fuzzed_height {
-            velocity.0.y = (velocity.0.y * -0.95).clamp(-BOID_MAX_SPEED, - 0.1);
+        if transform.translation.y > height {
+            velocity.0.y -= BOID_TURN_FACTOR;
         }
-
-        // // Teleport to opposite side of the screen
-        // if transform.translation.x.abs() > fuzzed_width {
-        //     transform.translation.x *= -1.;
-        // }
-        // if transform.translation.y.abs() > fuzzed_height {
-        //     transform.translation.y *= -1.;
-        // }
 
         // Clamp speed
         let speed = velocity.0.length();
@@ -273,14 +298,13 @@ fn velocity_system(
 }
 
 fn movement_system(
-    time: Res<Time>,
     mut query: Query<(&mut Velocity, &mut Transform)>,
 ) {
-    // Update position and keep boids within the window
     for (velocity, mut transform) in query.iter_mut() {
-        transform.translation.x = (transform.translation.x + velocity.0.x * time.delta_seconds())
-            .clamp(-BOUNDS.x / 2.0, BOUNDS.x / 2.0);
-        transform.translation.y = (transform.translation.y + velocity.0.y * time.delta_seconds())
-            .clamp(-BOUNDS.y / 2.0, BOUNDS.y / 2.0);
+        // https://stackoverflow.com/a/68929139
+        let angle = velocity.0.y.atan2(velocity.0.x);
+        transform.rotation = Quat::from_axis_angle(Vec3::Z, angle);
+        transform.translation.x += velocity.0.x;
+        transform.translation.y += velocity.0.y;
     }
 }
