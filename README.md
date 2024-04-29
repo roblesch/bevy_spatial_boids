@@ -1,7 +1,7 @@
 # bevy_spatial_boids
 ![image](https://github.com/roblesch/bevy_spatial_boids/assets/8890471/1b2620b9-3d75-4e76-866e-9eef1e0145bd)
 
-Boids on Bevy using k-d tree from [bevy_spatial](https://crates.io/crates/bevy_spatial)
+Boids on Bevy using [laundmo/bevy-spatial](https://github.com/laundmo/bevy-spatial)
 
 Dependencies
 - [bevyengine/bevy 0.13.2](https://github.com/bevyengine/bevy/tree/release-0.13.2)
