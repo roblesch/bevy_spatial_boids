@@ -3,6 +3,10 @@
 
 Boids on Bevy using [laundmo/bevy-spatial](https://github.com/laundmo/bevy-spatial)
 
+Links
+- [Blog post](https://blog.roblesch.page/blog/2024/04/29/bevy-boids.html)
+- [Interactive WASM](https://blog.roblesch.page/blog/2024/04/22/bevy-boids-interactive.html)
+
 Dependencies
 - [bevyengine/bevy 0.13.2](https://github.com/bevyengine/bevy/tree/release-0.13.2)
 - [laundmo/bevy-spatial 0.8.0](https://github.com/laundmo/bevy-spatial)
