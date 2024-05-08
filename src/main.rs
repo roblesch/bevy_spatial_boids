@@ -16,9 +16,10 @@ use bevy_spatial::{
 };
 
 const WINDOW_BOUNDS: Vec2 = Vec2::new(400., 400.);
-const BOID_BOUNDS: Vec2 = Vec2::new(WINDOW_BOUNDS.x * 2. / 3., WINDOW_BOUNDS.y * 2. / 3.);
-const BOID_COUNT: i32 = 500;
-const BOID_SIZE: f32 = 5.;
+const NEIGHBOR_CAP: usize = 0;
+const BOID_BOUNDARY_SIZE: f32 = 150.;
+const BOID_COUNT: i32 = 2048;
+const BOID_SIZE: f32 = 4.;
 const BOID_VIS_RANGE: f32 = 40.;
 const BOID_PROT_RANGE: f32 = 8.;
 // https://en.wikipedia.org/wiki/Bird_vision#Extraocular_anatomy
@@ -29,15 +30,17 @@ const BOID_MATCHING_FACTOR: f32 = 0.05;
 const BOID_AVOID_FACTOR: f32 = 0.05;
 const BOID_TURN_FACTOR: f32 = 0.2;
 const BOID_MOUSE_CHASE_FACTOR: f32 = 0.0005;
-const BOID_MIN_SPEED: f32 = 2.0;
-const BOID_MAX_SPEED: f32 = 4.0;
+const BOID_MIN_SPEED: f32 = 3.0;
+const BOID_MAX_SPEED: f32 = 6.0;
 
 fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
+                    canvas: Some("#bevy_boids_canvas".into()),
                     resolution: (WINDOW_BOUNDS.x, WINDOW_BOUNDS.y).into(),
+                    resizable: true,
                     ..default()
                 }),
                 ..default()
@@ -54,7 +57,7 @@ fn main() {
         .add_systems(FixedUpdate, (
             flocking_system,
             velocity_system,
-            movement_system
+            movement_system,
         ).chain())
         .add_systems(Update, (
             draw_boid_gizmos,
@@ -93,6 +96,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    window: Query<&Window>
 ) {
     commands.spawn(Camera2dBundle::default());
 
@@ -102,9 +106,11 @@ fn setup(
     let seq = halton::Sequence::new(2).zip(Sequence::new(3))
         .zip(1..BOID_COUNT);
 
+    let res = &window.single().resolution;
+
     for ((x, y), _) in seq {
-        let spawn_x = (x as f32 * WINDOW_BOUNDS.x) - WINDOW_BOUNDS.x / 2.0;
-        let spawn_y = (y as f32 * WINDOW_BOUNDS.y) - WINDOW_BOUNDS.y / 2.0;
+        let spawn_x = (x as f32 *  res.width()) -  res.width() / 2.0;
+        let spawn_y = (y as f32 * res.height()) - res.height() / 2.0;
 
         let mut transform = Transform::from_xyz(spawn_x, spawn_y, 0.0)
             .with_scale(Vec3::splat(BOID_SIZE));
@@ -144,17 +150,28 @@ fn setup(
     }
 }
 
+fn draw_boid_gizmos(
+    window: Query<&Window>,
+    mut gizmos: Gizmos,
+) {
+    let res = &window.single().resolution;
+
+    gizmos.rect_2d(
+        Vec2::ZERO,
+        0.0,
+        Vec2::new(
+            res.width() - BOID_BOUNDARY_SIZE,
+            res.height() - BOID_BOUNDARY_SIZE,
+        ),
+        Color::GRAY
+    );
+}
+
 fn angle_towards(a: Vec2, b: Vec2) -> f32 {
     // https://stackoverflow.com/a/68929139
     let dir = b - a;
     let angle = dir.y.atan2(dir.x);
     angle
-}
-
-fn draw_boid_gizmos(
-    mut gizmos: Gizmos,
-) {
-    gizmos.rect_2d(Vec2::ZERO, 0.0, BOID_BOUNDS, Color::GRAY);
 }
 
 fn flocking_dv(
@@ -173,8 +190,13 @@ fn flocking_dv(
     let mut neighboring_boids = 0;
     let mut close_boids = 0;
 
-    for (_, entity) in kdtree.within_distance(t0.translation.xy(), BOID_VIS_RANGE) {
+    for (i, (_, entity)) in kdtree.within_distance(t0.translation.xy(), BOID_VIS_RANGE).iter().enumerate() {
         let Ok((other, v1, t1)) = boid_query.get(entity.unwrap()) else { todo!() };
+
+        // Don't evaluate too many neighbors
+        if NEIGHBOR_CAP > 0 && i > NEIGHBOR_CAP {
+            break;
+        }
 
         // Don't evaluate against itself
         if *boid == other {
@@ -237,6 +259,7 @@ fn flocking_system(
     let boids_per_thread = (boids.len() + pool.thread_num() - 1) / pool.thread_num();
 
     // https://docs.rs/bevy/latest/bevy/tasks/struct.ComputeTaskPool.html
+    // https://github.com/kvietcong/rusty-boids
     for batch in pool.scope(|s| {
         for chunk in boids.chunks(boids_per_thread) {
             let kdtree = &kdtree;
@@ -264,6 +287,7 @@ fn flocking_system(
 fn velocity_system(
     mut events: EventReader<DvEvent>,
     mut boids: Query<(&mut Velocity, &mut Transform)>,
+    window: Query<&Window>,
 ) {
     for DvEvent(boid, dv) in events.read() {
         let Ok((mut velocity, transform)) = boids.get_mut(*boid) else { todo!() };
@@ -271,8 +295,10 @@ fn velocity_system(
         velocity.0.x += dv.x;
         velocity.0.y += dv.y;
 
-        let width = BOID_BOUNDS.x / 2.;
-        let height = BOID_BOUNDS.y / 2.;
+        let res = &window.single().resolution;
+
+        let width = (res.width() - BOID_BOUNDARY_SIZE) / 2.;
+        let height = (res.height() - BOID_BOUNDARY_SIZE) / 2.;
 
         // Steer back into visible region
         if transform.translation.x < -width {
@@ -305,7 +331,8 @@ fn movement_system(
 ) {
     for (velocity, mut transform) in query.iter_mut() {
         transform.rotation = Quat::from_axis_angle(
-            Vec3::Z, angle_towards(Vec2::ZERO, velocity.0));
+            Vec3::Z, angle_towards(Vec2::ZERO, velocity.0)
+        );
         transform.translation.x += velocity.0.x;
         transform.translation.y += velocity.0.y;
     }
