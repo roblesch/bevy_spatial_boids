@@ -15,12 +15,13 @@ use bevy_spatial::{
     SpatialStructure,
 };
 
-const WINDOW_BOUNDS: Vec2 = Vec2::new(400., 400.);
-const NEIGHBOR_CAP: usize = 0;
+const WINDOW_BOUNDS: Vec2 = Vec2::new(800., 400.);
+const NEIGHBOR_CAP: usize = 100;
 const BOID_BOUNDARY_SIZE: f32 = 150.;
-const BOID_COUNT: i32 = 2048;
-const BOID_SIZE: f32 = 4.;
+const BOID_COUNT: i32 = 256;
+const BOID_SIZE: f32 = 7.5;
 const BOID_VIS_RANGE: f32 = 40.;
+const VIS_RANGE_SQ: f32 = BOID_VIS_RANGE * BOID_VIS_RANGE;
 const BOID_PROT_RANGE: f32 = 8.;
 // https://en.wikipedia.org/wiki/Bird_vision#Extraocular_anatomy
 const BOID_FOV: f32 = 120. * std::f32::consts::PI / 180.;
@@ -30,8 +31,8 @@ const BOID_MATCHING_FACTOR: f32 = 0.05;
 const BOID_AVOID_FACTOR: f32 = 0.05;
 const BOID_TURN_FACTOR: f32 = 0.2;
 const BOID_MOUSE_CHASE_FACTOR: f32 = 0.0005;
-const BOID_MIN_SPEED: f32 = 3.0;
-const BOID_MAX_SPEED: f32 = 6.0;
+const BOID_MIN_SPEED: f32 = 2.0;
+const BOID_MAX_SPEED: f32 = 4.0;
 
 fn main() {
     App::new()
@@ -190,26 +191,28 @@ fn flocking_dv(
     let mut neighboring_boids = 0;
     let mut close_boids = 0;
 
-    for (i, (_, entity)) in kdtree.within_distance(t0.translation.xy(), BOID_VIS_RANGE).iter().enumerate() {
+    for (_, entity) in kdtree.k_nearest_neighbour(t0.translation.xy(), NEIGHBOR_CAP) {
         let Ok((other, v1, t1)) = boid_query.get(entity.unwrap()) else { todo!() };
-
-        // Don't evaluate too many neighbors
-        if NEIGHBOR_CAP > 0 && i > NEIGHBOR_CAP {
-            break;
-        }
 
         // Don't evaluate against itself
         if *boid == other {
             continue;
         }
 
-        // Don't evaluate boids behind
-        if angle_towards(t0.translation.xy(), t1.translation.xy()) > BOID_FOV {
+        let vec_to = (t1.translation - t0.translation).xy();
+        let dist_sq = vec_to.x * vec_to.x + vec_to.y * vec_to.y;
+
+        // Don't evaluate boids out of range
+        if dist_sq > VIS_RANGE_SQ {
             continue;
         }
 
-        let vec_to = (t1.translation - t0.translation).xy();
-        let dist_sq = vec_to.x * vec_to.x + vec_to.y * vec_to.y;
+        // Don't evaluate boids behind
+        if let Some(vec_to_norm) = vec_to.try_normalize() {
+            if t0.rotation.angle_between(Quat::from_rotation_arc_2d(Vec2::X, vec_to_norm)) > BOID_FOV {
+                continue;
+            }
+        }
 
         if dist_sq < PROT_RANGE_SQ {
             // separation
